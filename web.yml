@@ -1,0 +1,139 @@
+---
+- name: Create droplet
+  hosts: localhost
+  vars_files:
+    - group_vars/vault.yml
+  tasks:
+    - digital_ocean:
+        state: present
+        api_token: "{{do_api_token}}"
+        unique_name: yes
+        command: droplet
+        name: "{{web_droplet_name}}"
+        size_id: "{{web_droplet_size}}"
+        image_id: "{{web_droplet_image}}"
+        region_id: "{{web_droplet_region}}"
+        ssh_key_ids:
+          - "{{web_droplet_ssh_pk}}"
+      register: websrv
+
+    - add_host:
+        name: "{{websrv.droplet.ip_address}}"
+        groups: web
+      when: websrv.droplet is defined
+      changed_when: false
+
+    - digital_ocean_domain:
+        state: present
+        api_token: "{{do_api_token}}"
+        name: "{{domain}}"
+        ip: "{{websrv.droplet.ip_address}}"
+      when: websrv.droplet is defined
+      changed_when: false
+
+- name: Provision server
+  hosts: web
+  vars_files:
+    - group_vars/vault.yml
+  remote_user: root
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH.
+      local_action: "wait_for port=22 host={{ inventory_hostname }}"
+
+    - name: Install Python 2.x
+      raw: which python || apt-get update && apt-get install -qq -y python-simplejson
+      register: python_check
+      changed_when: not python_check.stdout | search('/usr/bin/python')
+
+    - name: Add repository for PHP 7.1
+      apt_repository: 
+        repo: "ppa:ondrej/php"
+
+    - name: Create sudo user
+      user:
+        name: "{{sudo_user}}"
+        password: "{{ upassword | password_hash('sha512') }}"
+        state: present
+        createhome: yes
+        groups: "sudo"
+        append: yes
+        shell: "/bin/bash"
+
+    - name: Add authorized_keys for sudo user
+      authorized_key:
+        user: "{{sudo_user}}"
+        key: "{{github_keys}}"
+
+    - name: Create web user
+      user:
+        name: "{{web_user}}"
+        state: present
+        createhome: yes
+        groups: "www-data"
+        append: yes
+        shell: "/bin/bash"
+        comment: "Comment"
+
+    - name: Add authorized_keys for the web user
+      authorized_key:
+        user: "{{web_user}}"
+        key: "{{github_keys}}"
+
+    - name: Add Composer to path
+      lineinfile: dest=/home/{{web_user}}/.bashrc state=present line='export PATH="$PATH:$HOME/.composer/vendor/bin"'
+
+- name: Provision roles
+  hosts: web
+  user: "{{sudo_user}}"
+  become: true
+  vars_files:
+    - group_vars/vault.yml
+  pre_tasks:
+    - name: "Create {{web_user}}/.composer"
+      file:
+        path: "/home/{{web_user}}/.composer"
+        state: directory
+        mode: 0755
+  roles:
+    - geerlingguy.swap
+    - geerlingguy.nginx
+    - geerlingguy.certbot
+    - geerlingguy.php
+    - geerlingguy.php-mysql
+    - geerlingguy.redis
+    - geerlingguy.git
+    - geerlingguy.composer
+    - geerlingguy.nodejs
+    - stevenjlho.deployer
+  post_tasks: 
+    - name: Install Certbot Plugin
+      apt: name="python-certbox-nginx"
+
+    - name: Create certificates
+      command: /opt/certbot/certbot-auto --nginx -n -d {{ item['host'] }} --email {{ item['admin_email'] }} --redirect --agree-tos
+      with_items: "{{ vhost_sites }}"
+
+- name: Provision Laravel application
+  hosts: web
+  remote_user: "{{web_user}}"
+  vars_files:
+    - group_vars/vault.yml
+  tasks:
+    - name: Get app from Github
+      git:
+        repo: "{{repo_url}}"
+        dest: /var/www/{{domain}}
+        version: "{{git_branch}}"
+
+    - name: "Make storage and cache folders writable by {{web_user}}"
+      file:
+        path: "/var/www/{{domain}}/storage"
+        owner: "{{web_user}}"
+        state: directory
+        mode: 0755
+
+    - name: Run composer install
+      shell: composer install
+      args:
+        chdir: "/var/www/{{domain}}"

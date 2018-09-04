@@ -1,0 +1,86 @@
+---
+- name: Create droplet
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - group_vars/vault.yml
+  tasks:
+    - digital_ocean:
+        state: present
+        api_token: "{{do_api_token}}"
+        unique_name: yes
+        command: droplet
+        name: "{{db_droplet_name}}"
+        size_id: "{{db_droplet_size}}"
+        image_id: "{{db_droplet_image}}"
+        region_id: "{{db_droplet_region}}"
+        ssh_key_ids:
+          - "{{db_droplet_ssh_pk}}"
+      register: dbsrv
+
+    - add_host:
+        name: "{{dbsrv.droplet.ip_address}}"
+        groups: db
+      when: dbsrv.droplet is defined
+      changed_when: false
+
+- name: Provision server
+  hosts: db
+  remote_user: root
+  gather_facts: false
+  vars_files:
+    - group_vars/vault.yml
+  tasks:
+    - name: Wait for SSH.
+      local_action: "wait_for port=22 host={{inventory_hostname}}"
+
+    - name: Install Python 2.x
+      raw: which python || apt-get update && apt-get install -qq -y python-simplejson
+      register: python_check
+      changed_when: not python_check.stdout | search('/usr/bin/python')
+
+    - name: Create sudo user
+      user:
+        name: "{{sudo_user}}"
+        password: "{{upassword | password_hash('sha512')}}"
+        state: present
+        createhome: yes
+        groups: "sudo"
+        append: yes
+        shell: "/bin/bash"
+
+    - name: Add authorized_keys for sudo user
+      authorized_key:
+        user: "{{sudo_user}}"
+        key: "{{github_keys}}"
+
+    - name: Create db user
+      user:
+        name: "{{db_user}}"
+        state: present
+        createhome: yes
+        groups: "www-data"
+        append: yes
+        shell: "/bin/bash"
+        comment: "Comment"
+
+    - name: Add authorized_keys for the db user
+      authorized_key:
+        user: "{{db_user}}"
+        key: "{{github_keys}}"
+
+- name: Provision roles
+  hosts: db
+  user: "{{sudo_user}}"
+  become: true
+  vars_files:
+    - group_vars/vault.yml
+  pre_tasks:
+    - name: "Create {{db_user}}/.mysql"
+      file:
+        path: "/home/{{db_user}}/.mysql"
+        state: directory
+        mode: 0755
+  roles:
+    - geerlingguy.swap
+    - geerlingguy.mysql
